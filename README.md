@@ -261,7 +261,7 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
 **Screenshot — Grafana dashboard showing API request metrics and memory usage:**
 
-![Grafana Dashboard](captures/grafana_charts.png)
+![Grafana Dashboard](captures/grafana-charts.png)
 
 **Screenshot — Portainer at http://78.138.58.14/portainer/:**
 
