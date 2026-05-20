@@ -11,11 +11,11 @@ The API is deployed and running on my VPS. You can test it directly:
 | Service | URL | Status |
 |---------|-----|--------|
 | API via Nginx | http://78.138.58.14 | public |
-| Grafana | http://78.138.58.14:3001 | internal (firewall) |
-| Prometheus | http://78.138.58.14:9090 | internal (firewall) |
-| Portainer | http://78.138.58.14:9000 | internal (firewall) |
+| Grafana | http://78.138.58.14/grafana/ | public |
+| Prometheus | http://78.138.58.14/prometheus/ | public |
+| Portainer | http://78.138.58.14/portainer/ | public |
 
-> Grafana, Prometheus and Portainer are running on the VPS but their ports are not open to the internet — only Nginx on port 80 is exposed. This is intentional for security.
+> All services are proxied through Nginx on port 80. Grafana, Prometheus and Portainer are accessible via subpaths — only port 80 is open on the VPS firewall, which is also better for security.
 
 ## Project Structure
 
@@ -115,11 +115,14 @@ The main `docker-compose.yml` runs three services on a custom Docker network I c
 | `dog` | `dog` | none — internal only |
 | `nginx` | — | `${NGINX_PORT}:80` |
 
-`cat` and `dog` don't expose any ports directly. The only way to reach them is through Nginx. Nginx listens on port 8090 (configured via `.env`) and routes traffic like this:
+`cat` and `dog` don't expose any ports directly. The only way to reach them is through Nginx. Nginx listens on port 80 (configured via `.env`) and routes traffic like this:
 
 - `GET /` — round-robin between `cat` and `dog` (load balancing)
 - `GET /cat` — always goes to the `cat` container only
 - `GET /dog` — always goes to the `dog` container only
+- `GET /grafana/` — proxied to Grafana
+- `GET /prometheus/` — proxied to Prometheus
+- `GET /portainer/` — proxied to Portainer
 
 Nginx also waits for both `cat` and `dog` to be healthy before starting, using `depends_on` with `condition: service_healthy`.
 
@@ -170,7 +173,7 @@ Once everything is running, I checked that each requirement from the evaluation 
 
 **Screenshot — `docker compose ps` showing all services Up and healthy:**
 
-![Compose PS](captures/docker-compose-ps.png)
+![Compose PS](captures/compose-ps-local.png)
 
 **Screenshot — Load balancing working: hostnames alternate between the two containers. `/cat` always returns `pet: cat`, `/dog` always returns `pet: dog`, and the counters are different between the two services:**
 
@@ -236,13 +239,13 @@ docker run --rm -v tp13_grafana-data:/data alpine tar czf - /data > grafana-back
 
 To monitor the stack I added four extra services in `docker-compose.yml`:
 
-| Service | Port | What it does |
-|---------|------|--------------|
-| **Prometheus** | 9091 | Scrapes metrics from the API (`/metrics`), from node-exporter and cAdvisor |
-| **Grafana** | 3001 | Displays dashboards — auto-provisioned, no manual setup needed |
+| Service | URL | What it does |
+|---------|-----|--------------|
+| **Prometheus** | http://78.138.58.14/prometheus/ | Scrapes metrics from the API (`/metrics`), from node-exporter and cAdvisor |
+| **Grafana** | http://78.138.58.14/grafana/ | Displays dashboards — auto-provisioned, no manual setup needed |
 | **node-exporter** | internal | Host CPU, memory, disk metrics |
 | **cAdvisor** | internal | Per-container CPU and memory usage |
-| **Portainer** | 9001 | Web UI to manage Docker containers |
+| **Portainer** | http://78.138.58.14/portainer/ | Web UI to manage Docker containers |
 
 Grafana is fully provisioned automatically. I didn't have to log in and click anything. It picks up the datasource and dashboard from files in `monitoring/grafana/provisioning/` and `monitoring/grafana/dashboards/`. Those files are versioned in the repo so anyone who clones the project gets the same dashboard.
 
@@ -252,7 +255,7 @@ For production, I created `docker-compose.prod.yml` which adds CPU and RAM limit
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
 
-**Screenshot — Prometheus UI at http://localhost:9091:**
+**Screenshot — Prometheus UI at http://78.138.58.14/prometheus/:**
 
 ![Prometheus](captures/prometheus:9091.png)
 
@@ -260,7 +263,7 @@ docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 
 ![Grafana Dashboard](captures/grafana_charts.png)
 
-**Screenshot — Portainer at http://localhost:9001:**
+**Screenshot — Portainer at http://78.138.58.14/portainer/:**
 
 ![Portainer](captures/portainer:9001.png)
 
@@ -311,7 +314,7 @@ I set up a GitHub Actions workflow at `.github/workflows/docker.yml` that runs a
 
 **Screenshot — GitHub Actions pipeline passing:**
 
-![GitHub Actions](captures/github-actions.png)
+![GitHub Actions](captures/github-action.png)
 
 ---
 
@@ -319,8 +322,15 @@ I set up a GitHub Actions workflow at `.github/workflows/docker.yml` that runs a
 
 The full stack is deployed on a VPS at **http://78.138.58.14**.
 
-The API is publicly accessible through Nginx on port 80. The internal services (Grafana, Prometheus, Portainer) are running but their ports are not open to the internet — only port 80 goes through the firewall. This is better from a security perspective.
+All services are publicly accessible through Nginx on port 80. The VPS firewall only exposes port 80, so Grafana, Prometheus and Portainer are served via Nginx subpath proxying:
+
+| Service | Public URL |
+|---------|-----------|
+| API | http://78.138.58.14/ |
+| Grafana | http://78.138.58.14/grafana/ |
+| Prometheus | http://78.138.58.14/prometheus/ |
+| Portainer | http://78.138.58.14/portainer/ |
 
 **Screenshot — `docker compose ps` on the VPS showing all services Up and healthy:**
 
-![VPS Compose PS](captures/vps-compose-ps.png)
+![VPS Compose PS](captures/docker-compose-ps.png)
