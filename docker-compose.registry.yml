@@ -1,0 +1,26 @@
+services:
+  registry:
+    image: registry:2
+    ports:
+      - "${REGISTRY_PORT:-5000}:5000"
+    volumes:
+      - registry-data:/var/lib/registry
+    environment:
+      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Origin: "['http://localhost:${REGISTRY_UI_PORT:-8080}']"
+      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Methods: "[HEAD,GET,OPTIONS,DELETE]"
+      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Credentials: "[true]"
+
+  registry-ui:
+    image: joxit/docker-registry-ui:latest
+    ports:
+      - "${REGISTRY_UI_PORT:-8080}:80"
+    environment:
+      - REGISTRY_TITLE=Mon Registry Privé
+      - REGISTRY_URL=http://registry:5000
+      - SINGLE_REGISTRY=true
+      - DELETE_IMAGES=true
+    depends_on:
+      - registry
+
+volumes:
+  registry-data:
