@@ -6,7 +6,7 @@ services:
     volumes:
       - registry-data:/var/lib/registry
     environment:
-      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Origin: "['http://localhost:${REGISTRY_UI_PORT:-8080}']"
+      REGISTRY_HTTP_HEADERS_Access-Control-Allow-Origin: "['${REGISTRY_UI_URL:-http://localhost:8080}']"
       REGISTRY_HTTP_HEADERS_Access-Control-Allow-Methods: "[HEAD,GET,OPTIONS,DELETE]"
       REGISTRY_HTTP_HEADERS_Access-Control-Allow-Credentials: "[true]"
 

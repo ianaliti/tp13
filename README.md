@@ -1,4 +1,21 @@
-# TP13 — Docker Evaluation
+# TP13 — My Docker Project
+
+## What this project is about
+
+For this TP I had to build a complete Docker stack around a Node.js API. The goal was to go through everything we learned in class : writing a proper Dockerfile, setting up a multi-service Compose stack, using a private registry, load-balancing with Nginx, adding monitoring with Prometheus and Grafana, and automating everything with a CI/CD pipeline on GitHub Actions.
+
+## Live on VPS
+
+The API is deployed and running on my VPS. You can test it directly:
+
+| Service | URL | Status |
+|---------|-----|--------|
+| API via Nginx | http://78.138.58.14 | public |
+| Grafana | http://78.138.58.14:3001 | internal (firewall) |
+| Prometheus | http://78.138.58.14:9090 | internal (firewall) |
+| Portainer | http://78.138.58.14:9000 | internal (firewall) |
+
+> Grafana, Prometheus and Portainer are running on the VPS but their ports are not open to the internet — only Nginx on port 80 is exposed. This is intentional for security.
 
 ## Project Structure
 
@@ -6,104 +23,117 @@
 tp13/
 ├── .github/
 │   └── workflows/
-│       └── docker.yml
+│       └── docker.yml          ← CI/CD pipeline (build + scan + push)
 ├── api/
-│   ├── app.js
+│   ├── app.js                  ← the Node.js API
 │   ├── package.json
 │   ├── Dockerfile
 │   └── .dockerignore
 ├── nginx/
-│   └── default.conf
+│   └── default.conf            ← reverse proxy + load balancer
 ├── monitoring/
-│   ├── prometheus.yml
+│   ├── prometheus.yml          ← what Prometheus scrapes
 │   └── grafana/
-│       ├── provisioning/
-│       │   ├── datasources/prometheus.yml
-│       │   └── dashboards/dashboard.yml
-│       └── dashboards/
-│           └── api-dashboard.json
-├── captures/
-├── docker-compose.yml
-├── docker-compose.registry.yml
-├── docker-compose.prod.yml
-├── .env
+│       ├── provisioning/       ← auto-setup datasource + dashboards
+│       └── dashboards/         ← the actual dashboard JSON
+├── captures/                   ← all screenshots for this report
+├── docker-compose.yml          ← main stack
+├── docker-compose.registry.yml ← private registry stack
+├── docker-compose.prod.yml     ← production overrides (CPU/RAM limits)
+├── .env                        ← all configurable values
 └── README.md
 ```
 
 ---
 
-## Part 1 — API & Dockerfile
+## Part 1 — Building the API and its Dockerfile
 
-The Node.js Express API lives in `api/`. It exposes three routes:
+The first thing I did was write the Node.js API in `api/app.js`. I used Express and exposed three routes:
 
-- `GET /` — returns the container hostname (`os.hostname()`), the `PET` environment variable value, and a request counter incremented on each call
-- `GET /healthz` — returns `{ "status": "ok" }` with HTTP 200, used by the Docker HEALTHCHECK
-- `GET /metrics` — Prometheus metrics exposed via `prom-client` (request counter + default Node.js metrics)
+- `GET /` — returns the container hostname, which `PET` animal this container is (`cat` or `dog`), and a counter that increments with every request. This counter is useful later to prove load balancing is working.
+- `GET /healthz` — just returns `{ "status": "ok" }` with HTTP 200. Docker uses this to know if the container is alive and ready.
+- `GET /metrics` — exposes Prometheus metrics using the `prom-client` library so Grafana can graph them later.
 
-### Dockerfile highlights
+**Screenshot — GET /healthz returning 200 ok:**
 
-- Base image: `node:20-alpine`
-- `COPY package*.json ./` first to leverage Docker layer cache for `npm install`
-- `RUN npm install --only=production` — no dev dependencies in the image
-- `COPY . .` after installing dependencies
-- Non-root user: creates `appuser` in `appgroup` and switches to it with `USER appuser`
-- `HEALTHCHECK` targets `/healthz` with `--interval=10s --timeout=5s --start-period=15s --retries=3`
-- `.dockerignore` excludes `node_modules`, `.env`, `.git`
+![healthz](captures/get-healthz.png)
+
+**Screenshot — GET /metrics exposing Prometheus data:**
+
+![metrics](captures/get-metrics.png)
+
+### The Dockerfile
+
+For the Dockerfile I chose `node:20-alpine` as the base image. Alpine is a minimal Linux distribution — the image is around 130 MB total instead of ~950 MB for `node:latest` which is based on Debian. Less packages = less attack surface = less vulnerabilities.
+
+I also made sure to:
+- Copy `package*.json` first and run `npm install --only=production` before copying the rest of the code. This is a Docker caching trick : if I only change `app.js`, Docker reuses the cached `npm install` layer and the build is much faster.
+- Run the app as a non-root user (`appuser`) — running as root inside a container is a bad practice.
+- Add a `HEALTHCHECK` on `/healthz` so Docker knows when the container is actually ready.
+- Add a `.dockerignore` to exclude `node_modules`, `.env` and `.git` from the build context.
 
 ---
 
 ## Part 2 — Private Registry
 
-The private registry stack is defined in `docker-compose.registry.yml` and runs independently from the main stack.
+Instead of using Docker Hub, I set up my own private registry running locally. It uses the official `registry:2` image and a web UI (`joxit/docker-registry-ui`) to browse images visually.
 
-**Start the registry:**
+The registry runs in its own separate Compose file so it can stay up independently of the main stack.
+
 ```bash
+# Start the registry
 docker compose -f docker-compose.registry.yml --env-file .env up -d
-```
 
-**Build and push the API image:**
-```bash
+# Build the API image and push it to the private registry
 docker build -t localhost:5001/mon-api:1.0.0 ./api
 docker push localhost:5001/mon-api:1.0.0
 ```
 
-The `image:` field in `docker-compose.yml` references `localhost:${REGISTRY_PORT:-5001}/mon-api:1.0.0`.
+**Screenshot — Building the API image:**
 
-**Screenshot — Registry UI (http://localhost:8080) showing the image listed:**
+![Docker Build](captures/docker-build.png)
 
-![Registry UI](captures/registry-ui.png)
+**Screenshot — Pushing the image to the private registry:**
+
+![Docker Push](captures/docker-push.png)
+
+**Screenshot — Registry UI at http://localhost:8080 showing the image:**
+
+![Registry UI](captures/private-registry.png)
+
+The `docker-compose.yml` uses `localhost:${REGISTRY_PORT}/mon-api:1.0.0` as the image, so it always pulls from my private registry.
 
 ---
 
-## Part 3 — Compose Stack & Nginx
+## Part 3 — Compose Stack and Nginx
 
-The main `docker-compose.yml` orchestrates three services on a custom bridge network `internal`:
+The main `docker-compose.yml` runs three services on a custom Docker network I called `internal`:
 
-| Service | Image | PET | Exposed port |
-|---------|-------|-----|-------------|
-| `cat` | `localhost:5001/mon-api:1.0.0` | `cat` | none (internal only) |
-| `dog` | `localhost:5001/mon-api:1.0.0` | `dog` | none (internal only) |
-| `nginx` | `nginx:alpine` | — | `${NGINX_PORT}:80` |
+| Service | PET variable | Port visible to host |
+|---------|-------------|----------------------|
+| `cat` | `cat` | none — internal only |
+| `dog` | `dog` | none — internal only |
+| `nginx` | — | `${NGINX_PORT}:80` |
 
-`nginx` depends on `cat` and `dog` with `condition: service_healthy`, so it only starts once both API containers pass their healthcheck.
+`cat` and `dog` don't expose any ports directly. The only way to reach them is through Nginx. Nginx listens on port 8090 (configured via `.env`) and routes traffic like this:
 
-**Nginx routing (`nginx/default.conf`):**
-- `GET /` — round-robin between `cat:3000` and `dog:3000`
-- `GET /cat` — exclusively to `cat:3000` (path stripped via trailing slash on `proxy_pass`)
-- `GET /dog` — exclusively to `dog:3000` (path stripped via trailing slash on `proxy_pass`)
+- `GET /` — round-robin between `cat` and `dog` (load balancing)
+- `GET /cat` — always goes to the `cat` container only
+- `GET /dog` — always goes to the `dog` container only
 
-**Start the main stack:**
-```bash
-docker compose up -d
-```
+Nginx also waits for both `cat` and `dog` to be healthy before starting, using `depends_on` with `condition: service_healthy`.
+
+**Screenshot — API response at http://localhost:8090:**
+
+![API Response](captures/localhost:8090.png)
 
 ---
 
 ## Part 4 — Security
 
-### Environment variables
+### No hardcoded values
 
-All configurable values are defined in `.env` — no hardcoded values in `docker-compose.yml` or the Dockerfile:
+Everything that can be configured is in the `.env` file. Nothing is hardcoded in `docker-compose.yml` or the Dockerfile:
 
 ```env
 API_PORT=3000
@@ -115,9 +145,12 @@ PROMETHEUS_PORT=9091
 REGISTRY_PORT=5001
 REGISTRY_UI_PORT=8080
 PORTAINER_PORT=9001
+GRAFANA_PASSWORD=admin
 ```
 
-### Trivy scan
+### Scanning with Trivy
+
+I scanned the image with Trivy to check for known vulnerabilities:
 
 ```bash
 trivy image localhost:5001/mon-api:1.0.0
@@ -125,60 +158,49 @@ trivy image localhost:5001/mon-api:1.0.0
 
 **Screenshot — Trivy scan output:**
 
-![Trivy Scan](captures/trivy-scan.png)
+![Trivy Scan](captures/trivy.png)
 
-### Why `node:20-alpine` and not `node:latest`?
-
-`node:latest` is based on Debian Bookworm (~950 MB). It ships hundreds of system packages (compilers, utilities, libraries) that are completely unnecessary at runtime. Each one is a potential CVE surface.
-
-`node:20-alpine` is based on Alpine Linux (~130 MB total image size). It contains only the OS packages required to run Node.js. The result: far fewer CVEs reported by Trivy. In practice, `node:latest` may report dozens of HIGH/CRITICAL CVEs from system-level packages, while `node:20-alpine` reports zero CRITICAL CVEs on this project.
-
-Additionally, a smaller image means faster pulls, less storage, and a reduced attack surface in production.
+The result is **0 CRITICAL CVEs**. There are some LOW and MEDIUM ones in Node.js packages but nothing critical. This is exactly why I chose `node:20-alpine` over `node:latest` — Debian-based images ship with many more packages and usually report dozens of HIGH and CRITICAL CVEs just from system libraries that are not even used by the app.
 
 ---
 
-## Part 5 — Stack Validation
+## Part 5 — Validating the Stack
 
-**Screenshot — `docker compose ps` showing all services Up (healthy):**
+Once everything is running, I checked that each requirement from the evaluation works:
 
-![Compose PS](captures/compose-ps.png)
+**Screenshot — `docker compose ps` showing all services Up and healthy:**
 
-**Screenshot — Load balancing: consecutive calls to `GET /` alternate between `cat` and `dog` hostnames:**
+![Compose PS](captures/docker-compose-ps.png)
 
-![Load Balancing](captures/load-balancing.png)
+**Screenshot — Load balancing working: hostnames alternate between the two containers. `/cat` always returns `pet: cat`, `/dog` always returns `pet: dog`, and the counters are different between the two services:**
 
-**Screenshot — `/cat` returns `pet: cat`, `/dog` returns `pet: dog`, counters differ between the two:**
-
-![Cat Dog Routes](captures/cat-dog-routes.png)
+![Routes and Load Balancing](captures/route-dog_cat.png)
 
 ---
 
 ## Part 6 — Theoretical Questions
 
-### Question: Docker Swarm — `docker compose up` vs `docker stack deploy`
+### Docker Swarm — `docker compose up` vs `docker stack deploy`
 
-`docker compose up` is a local development tool. It reads a `docker-compose.yml`, creates containers directly on the local Docker engine, and manages their lifecycle (start, stop, logs) on a single machine.
+`docker compose up` is a local tool. It runs containers on a single machine using a `docker-compose.yml` file. It is perfect for development but not for production at scale.
 
-`docker stack deploy` deploys a stack onto a **Docker Swarm cluster** (one or more nodes). It distributes services across nodes with built-in features like automatic replication, rolling updates, and failure recovery across the cluster.
+`docker stack deploy` is for **Docker Swarm** — a cluster of multiple machines. It distributes services across nodes, handles automatic restarts if a container crashes, and supports rolling updates with zero downtime.
 
-**Why can't `build:` be used with Swarm?**
+**Why can't `build:` be used in Swarm?**
 
-When deploying a stack with `docker stack deploy`, the services are scheduled across multiple Swarm worker nodes. Those workers only know how to **pull** images from a registry — they do not have access to the source code on the manager node. The `build:` directive requires the source code to be present locally and Docker to build the image on-the-fly. This is incompatible with distributed scheduling. The correct workflow for Swarm is: build the image locally → push to a registry → reference the image via `image:` in the stack file.
+When Swarm schedules a service, it can run it on any machine in the cluster. Worker nodes don't have access to the source code — they can only pull pre-built images from a registry. The `build:` directive needs the source code to be present locally. So the right workflow is: build the image → push it to a registry → reference it with `image:` in the stack file.
 
 ---
 
-### Question: Docker Secrets vs environment variables
+### Docker Secrets vs environment variables
 
-**Environment variable (via `.env` / `environment:`):**
-The value is stored in plain text in the container configuration, visible via `docker inspect`, in shell history, and in logs if printed. It is convenient but insecure for sensitive data like passwords or tokens.
+**Environment variable:**
+Stored in plain text in the container config. Visible with `docker inspect`. If someone gets access to the host, they can read all env vars easily. Fine for non-sensitive config, bad for passwords.
 
 **Docker Secret:**
-A Swarm-native mechanism where the secret value is encrypted in transit and at rest (stored in the Raft consensus log). It is never exposed as an environment variable.
+A Swarm-native feature. The secret is encrypted in transit and at rest. It is never stored as an env var — instead it appears as a file inside the container at `/run/secrets/<secret-name>`. Even with `docker inspect` you cannot read it.
 
-**Where is the secret accessible inside the container?**
-It is mounted as a file at `/run/secrets/<secret-name>`.
-
-**How to read it from Node.js:**
+**Reading a secret in Node.js:**
 ```js
 const fs = require('fs');
 const dbPassword = fs.readFileSync('/run/secrets/db_password', 'utf8').trim();
@@ -186,107 +208,108 @@ const dbPassword = fs.readFileSync('/run/secrets/db_password', 'utf8').trim();
 
 ---
 
-### Question: Production Backup Strategy
+### What to back up in production
 
-**What must absolutely be backed up:**
+If the server dies, here is what I cannot recover automatically:
 
-| Category | Examples | Why |
-|----------|---------|-----|
-| **Persistent volumes** (irreplaceable) | Database data, Grafana dashboards, Registry images | Created at runtime; cannot be rebuilt from code |
-| **Secret config** (irreplaceable) | `.env` files with passwords/tokens, TLS certificates and private keys | Not in Git; lost if the server dies |
+| What | Examples | Why it is irreplaceable |
+|------|----------|------------------------|
+| Named volumes | Grafana data, Prometheus data, registry images | Created at runtime, not in Git |
+| Secret config | `.env` with real passwords, TLS certificates | Not in Git by design |
 
-**What is automatically recreatable:**
+What I can recreate automatically (no backup needed):
 
-| Category | Examples | Why |
-|----------|---------|-----|
-| Docker images | All images | Rebuilt from Dockerfiles via CI/CD |
-| Containers | All containers | Ephemeral by design |
-| Versioned config | `docker-compose.yml`, `nginx/default.conf`, `prometheus.yml` | Already in Git |
+| What | Why |
+|------|-----|
+| Docker images | Rebuilt by CI/CD from Dockerfiles |
+| Containers | Ephemeral by design |
+| Config files | Already in Git (`docker-compose.yml`, `nginx/default.conf`, etc.) |
 
-**Recommended backup commands for volumes:**
+**Backup command for a named volume:**
 ```bash
-# Backup a named volume to a tar archive
 docker run --rm -v tp13_grafana-data:/data alpine tar czf - /data > grafana-backup.tar.gz
-
-# Restore
-docker run --rm -v tp13_grafana-data:/data alpine tar xzf - -C / < grafana-backup.tar.gz
 ```
-
-Store backups in an external, encrypted location (S3, off-site server).
 
 ---
 
-## Part 7 — Observability & Production
+## Part 7 — Observability and Production
 
-The monitoring stack is integrated into `docker-compose.yml`:
+To monitor the stack I added four extra services in `docker-compose.yml`:
 
-| Service | Port | Purpose |
-|---------|------|---------|
-| **Prometheus** | `9091` | Scrapes metrics from API (`/metrics`), node-exporter, cAdvisor |
-| **Grafana** | `3001` | Dashboards — auto-provisioned from `monitoring/grafana/` |
-| **node-exporter** | internal | Host system metrics (CPU, memory, disk) |
-| **cAdvisor** | internal | Per-container resource metrics |
-| **Portainer** | `9001` | Docker management UI |
+| Service | Port | What it does |
+|---------|------|--------------|
+| **Prometheus** | 9091 | Scrapes metrics from the API (`/metrics`), from node-exporter and cAdvisor |
+| **Grafana** | 3001 | Displays dashboards — auto-provisioned, no manual setup needed |
+| **node-exporter** | internal | Host CPU, memory, disk metrics |
+| **cAdvisor** | internal | Per-container CPU and memory usage |
+| **Portainer** | 9001 | Web UI to manage Docker containers |
 
-Grafana is provisioned automatically via:
-- `monitoring/grafana/provisioning/datasources/prometheus.yml` — connects to Prometheus
-- `monitoring/grafana/provisioning/dashboards/dashboard.yml` — loads dashboards from disk
-- `monitoring/grafana/dashboards/api-dashboard.json` — the actual dashboard (requests, memory, CPU)
+Grafana is fully provisioned automatically. I didn't have to log in and click anything. It picks up the datasource and dashboard from files in `monitoring/grafana/provisioning/` and `monitoring/grafana/dashboards/`. Those files are versioned in the repo so anyone who clones the project gets the same dashboard.
 
-The `docker-compose.prod.yml` override file adds CPU and RAM limits on every service via `deploy.resources`. Apply it with:
+For production, I created `docker-compose.prod.yml` which adds CPU and RAM limits to every service using `deploy.resources`. Run it like this:
+
 ```bash
 docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
 ```
+
+**Screenshot — Prometheus UI at http://localhost:9091:**
+
+![Prometheus](captures/prometheus:9091.png)
+
+**Screenshot — Grafana dashboard showing API request metrics and memory usage:**
+
+![Grafana Dashboard](captures/grafana_charts.png)
+
+**Screenshot — Portainer at http://localhost:9001:**
+
+![Portainer](captures/portainer:9001.png)
 
 ---
 
 ## Part 8 — Volumes
 
-**Named volumes** (managed by Docker, for persistent data):
+I used two types of volume mounts in this project:
 
-| Volume | Service | Purpose |
-|--------|---------|---------|
-| `prometheus-data` | prometheus | Time-series data |
-| `grafana-data` | grafana | Dashboards, users, settings |
-| `portainer-data` | portainer | Portainer state |
-| `registry-data` | registry | Pushed Docker images |
+**Named volumes** — Docker manages them. Used for data that must survive container restarts:
 
-**Bind mounts** (config files injected from host, versioned in Git):
+| Volume | Service | What it stores |
+|--------|---------|----------------|
+| `prometheus-data` | prometheus | All scraped metrics (time series) |
+| `grafana-data` | grafana | Dashboards, users, alert config |
+| `portainer-data` | portainer | Portainer internal state |
+| `registry-data` | registry | All pushed Docker images |
 
-| Host path | Container path | Service |
-|-----------|---------------|---------|
+**Bind mounts** — I control the file on the host. Used for config files that are versioned in Git:
+
+| File on my machine | Path inside container | Service |
+|--------------------|-----------------------|---------|
 | `./nginx/default.conf` | `/etc/nginx/conf.d/default.conf` | nginx |
 | `./monitoring/prometheus.yml` | `/etc/prometheus/prometheus.yml` | prometheus |
 | `./monitoring/grafana/provisioning` | `/etc/grafana/provisioning` | grafana |
 | `./monitoring/grafana/dashboards` | `/var/lib/grafana/dashboards` | grafana |
 
-**Why this split?** Named volumes are used for data that must survive container restarts and is created at runtime (Grafana state, Prometheus TSDB). Bind mounts are used for configuration that is version-controlled — so any change to a config file is immediately reflected without rebuilding the image.
+The logic is simple: if the data is created at runtime (like Grafana saving a new dashboard), use a named volume. If the data is a config file I write myself, use a bind mount so it stays in Git.
 
-**Screenshot — `docker volume ls`:**
+**Screenshot — `docker volume ls` listing all the named volumes:**
 
-![Volume LS](captures/volume-ls.png)
+![Volume LS](captures/docker_volume-ls.png)
 
 **Screenshot — `docker volume inspect tp13_grafana-data`:**
 
-![Volume Inspect](captures/volume-inspect.png)
+![Volume Inspect](captures/docker_volume_grafana-data.png)
 
 ---
 
 ## Part 9 — CI/CD with GitHub Actions
 
-The workflow `.github/workflows/docker.yml` triggers on every push to `main`.
+I set up a GitHub Actions workflow at `.github/workflows/docker.yml` that runs automatically on every push to `main`. It does four things in order:
 
-**Steps:**
-1. **Checkout** — fetches the repository
-2. **Set up Docker Buildx** — enables BuildKit
-3. **Login to GHCR** — authenticates to `ghcr.io` using the automatic `GITHUB_TOKEN`
-4. **Build image** — builds from `./api`, loaded locally (not pushed yet)
-5. **Trivy scan** — scans the built image; the pipeline **fails** if any `CRITICAL` CVE is found
-6. **Push** — pushes the image to `ghcr.io/ianaliti/mon-api:git-<SHA>`
+1. **Build** the Docker image from `./api`
+2. **Scan** it with Trivy — if any CRITICAL CVE is found, the pipeline fails and the image is not pushed
+3. **Login** to GitHub Container Registry (ghcr.io) using the automatic `GITHUB_TOKEN` — no extra secrets to configure
+4. **Push** the image with a tag based on the short Git SHA: `ghcr.io/ianaliti/mon-api:git-<sha>`
 
-No extra secrets required — `GITHUB_TOKEN` is provided automatically by GitHub Actions.
-
-**Screenshot — GitHub Actions pipeline in success:**
+**Screenshot — GitHub Actions pipeline passing:**
 
 ![GitHub Actions](captures/github-actions.png)
 
@@ -294,40 +317,10 @@ No extra secrets required — `GITHUB_TOKEN` is provided automatically by GitHub
 
 ## Part 10 — VPS Deployment
 
-The full stack is deployed on the VPS at **http://78.138.58.14**.
+The full stack is deployed on a VPS at **http://78.138.58.14**.
 
-| Service | URL |
-|---------|-----|
-| API via Nginx | http://78.138.58.14 |
-| Prometheus | http://78.138.58.14:9090 |
-| Grafana | http://78.138.58.14:3001 |
-| Portainer | http://78.138.58.14:9000 |
+The API is publicly accessible through Nginx on port 80. The internal services (Grafana, Prometheus, Portainer) are running but their ports are not open to the internet — only port 80 goes through the firewall. This is better from a security perspective.
 
-**Screenshot — `docker compose ps` on the VPS (all services Up healthy):**
+**Screenshot — `docker compose ps` on the VPS showing all services Up and healthy:**
 
 ![VPS Compose PS](captures/vps-compose-ps.png)
-
----
-
-## How to run this project
-
-**Prerequisites:** Docker and Docker Compose installed.
-
-```bash
-# 1. Clone the repository
-git clone https://github.com/ianaliti/tp13.git
-cd tp13
-
-# 2. Start the private registry
-docker compose -f docker-compose.registry.yml --env-file .env up -d
-
-# 3. Build and push the API image
-docker build -t localhost:5001/mon-api:1.0.0 ./api
-docker push localhost:5001/mon-api:1.0.0
-
-# 4. Start the main stack
-docker compose up -d
-
-# 5. Verify all services are healthy
-docker compose ps
-```
